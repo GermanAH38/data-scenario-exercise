@@ -1,81 +1,115 @@
-# Technical Exercise: Support Data Scenario
+ANSWERS.md
+1. First response time by team
 
-Thanks for taking the time to work through this technical exercise. It's meant to reflect the kind of data work that comes up as a team lead. Note: nothing here requires advanced SQL, just clear thinking through a realistic situation.
+Query:
 
-**Time estimate:** 30–45 minutes.
+SELECT
+    a.team,
+    AVG(t.first_response_minutes) AS avg_first_response_minutes
+FROM tickets t
+JOIN agents a ON t.agent_id = a.agent_id
+WHERE t.closed_at >= NOW() - INTERVAL '30 days'GROUP BY a.team
+ORDER BY avg_first_response_minutes DESC;
 
-## How to Submit
 
-1. Fork this repo (or clone the gist).
-2. Add your answers into a copy of this file (`ANSWERS.md`), with your SQL and short answers inline.
-3. Submit the link to your fork (or your branch/PR) using the form link provided.
+2. Agents with above-average reopen rates (vs. their own team)
 
-You're welcome to use whatever tools you'd normally reach for on the job. However, please be ready to walk through your reasoning afterward.
+Query:
 
----
+WITH agent_rates AS (
+    SELECT
+        a.agent_id,
+        a.name,
+        a.team,
+        COUNT(*) AS total_tickets,
+        SUM(CASE WHEN t.reopened_count > 0 THEN 1 ELSE 0 END) AS reopened_tickets,
+        SUM(CASE WHEN t.reopened_count > 0 THEN 1 ELSE 0 END)::float
+            / COUNT(*) AS reopen_rate
+    FROM tickets t
+    JOIN agents a ON t.agent_id = a.agent_id
+    GROUP BY a.agent_id, a.name, a.team
+),
+team_avg AS (
+    SELECT team, AVG(reopen_rate) AS team_avg_rate
+    FROM agent_rates
+    GROUP BY team
+)
+SELECT
+    ar.agent_id,
+    ar.name,
+    ar.team,
+    ROUND(ar.reopen_rate::numeric, 3) AS agent_reopen_rate,
+    ROUND(ta.team_avg_rate::numeric, 3) AS team_avg_reopen_rate
+FROM agent_rates ar
+JOIN team_avg ta ON ar.team = ta.team
+WHERE ar.reopen_rate > ta.team_avg_rate
+ORDER BY ar.team, agent_reopen_rate DESC;
 
-## Sample Schema
+3. CSAT trend by category, last 3 months
 
-Assume three tables from a support ticketing system:
+Query:
 
-**tickets**
-| Column | Type | Description |
-|---|---|---|
-| ticket_id | integer | Primary key |
-| agent_id | integer | Foreign key to agents.agent_id |
-| category | text | e.g. Billing, Technical, Account, Shipping |
-| priority | text | Low, Medium, High, Urgent |
-| status | text | open, closed, reopened |
-| opened_at | timestamp | When the ticket was created |
-| closed_at | timestamp | When the ticket was closed (null if still open) |
-| first_response_minutes | integer | Minutes until the first agent reply |
-| reopened_count | integer | Number of times the ticket was reopened after closing |
+SELECT
+    t.category,
+    DATE_TRUNC('month', c.submitted_at) AS month,
+    AVG(c.score) AS avg_csat
+FROM csat_responses c
+JOIN tickets t ON c.ticket_id = t.ticket_id
+WHERE c.submitted_at >= NOW() - INTERVAL '3 months'
+GROUP BY t.category, DATE_TRUNC('month', c.submitted_at)
+ORDER BY t.category, month;
 
-**agents**
-| Column | Type | Description |
-|---|---|---|
-| agent_id | integer | Primary key |
-| name | text | Agent name |
-| team | text | Team the agent sits on |
-| hire_date | date | Date the agent started |
+4. Digging in
 
-**csat_responses**
-| Column | Type | Description |
-|---|---|---|
-| response_id | integer | Primary key |
-| ticket_id | integer | Foreign key to tickets.ticket_id |
-| score | integer | 1–5 satisfaction score |
-| submitted_at | timestamp | When the customer submitted the score |
+Beyond these three tables, I'd want:
 
----
+A sub-issue/tag field on tickets (e.g., "refund delay," "double charge," "billing error") since category alone is too broad to point at a specific cause.
 
-## The Scenario
+Where I'd start and why: 
+With the tickets table itself, cut two ways I can build from existing columns: 
+By priority to check if reopens are concentrated in Urgent/High tickets which would point to a calibration issue (agents closing tickets before they're truly resolved, under time pressure to hit the target) rather than something specific to Billing.
+And by agent hire_date (joining to agents and csat_responses) to check if newer hires are pulling the average down which would point to a training gap rather than a process or system issue.
 
-You're leading a small support team. Leadership has noticed that CSAT scores for the **Billing** category dropped 12% last month. Ticket volume in Billing stayed roughly flat over the same period, and nothing changed in staffing. You've been asked to look into it and report back.
+I like starting here because both cuts use data I already have with no new pull required and they split the possible causes into different buckets (agent alignment on resolution standards vs. agent experience) before I go looking for anything outside these three tables.
 
-Work through the following as you would if this landed in your inbox tomorrow.
+5. Testing a theory
 
-**1. First response time by team**
-Write a query returning the average `first_response_minutes` for tickets closed in the last 30 days, grouped by agent team.
+Theory (Priority): Billing's mix shifted toward higher-priority tickets last month (which are inherently harder to satisfy quickly), or high-priority Billing tickets specifically are reopening more, and that's pulling CSAT down.
 
-**2. Agents with above-average reopen rates**
-Write a query returning each agent's reopen rate (reopened tickets ÷ total tickets they handled) for agents whose rate is higher than their own team's average.
+Query:
 
-**3. CSAT trend by category**
-Write a query returning the average CSAT score per category, per month, for the last 3 months.
+SELECT
+    t.priority,
+    COUNT(*) AS total_billing_tickets,
+    SUM(CASE WHEN t.reopened_count > 0 THEN 1 ELSE 0 END) AS reopened_tickets,
+    ROUND(
+        SUM(CASE WHEN t.reopened_count > 0 THEN 1 ELSE 0 END)::numeric
+        / COUNT(*), 3
+    ) AS reopen_rate,
+    ROUND(AVG(c.score)::numeric, 2) AS avg_csat
+FROM tickets t
+LEFT JOIN csat_responses c ON c.ticket_id = t.ticket_id
+WHERE t.category = 'Billing'
+  AND t.opened_at >= NOW() - INTERVAL '1 month'
+GROUP BY t.priority
+ORDER BY reopen_rate DESC;
 
-**4. Digging in**
-Beyond the three tables above, what additional data would you want to pull to understand the Billing drop — and which of the existing tables would you start with, and why?
+6. What you'd actually do next week
 
-**5. Testing a theory**
-Pick one specific theory for what might be driving the drop. State your theory, then write a query using the tables above that would help confirm or rule it out.
+Assuming the query confirms reopens spiked and most trace back to refund timing questions:
 
-**6. What you'd actually do**
-Say your query in Question 5 showed that reopened tickets in Billing spiked, and most of the reopens trace back to one specific issue type (e.g., refund timing questions). What would you actually do with that in the next week? Be concrete. What would you say to the team, what (if anything) would you change in a process or macro, and how would you know if it worked?
+This week: Pull 10–15 of the reopened refund-timing tickets and read them closely to determine: if it's a knowledge gap (agents giving wrong timelines), a policy change nobody communicated, or a system delay that's now longer than what agents are telling customers?
+Team conversation (Open and concrete): "Refund timing questions are driving a chunk of our reopens and CSAT dip. Here's what I'm seeing, here's what I want to fix together." While clearly setting expectations on what needs to happen.
+Process/macro change: Update the refund-timing macro/knowledge base article with accurate, current timelines (coordinating with whoever owns the actual refund process if it changed). Make sure agents are setting expectations that match reality, and encourage a proactive follow-up touch (e.g., "your refund typically posts in X business days — I'll check back if it hasn't by then") instead of waiting for a reopen.
+How I'd know it worked: Track Billing reopen rate and CSAT weekly for the next 2–3 weeks. I'd expect reopens tied to refund timing to drop first, with CSAT following within a few weeks (CSAT usually lags the operational fix).
 
-**7. Reporting up and coaching down**
-You need to update your own manager on this in two sentences, and separately coach one agent on it in a 1:1. How would those two conversations differ?
+7. Reporting up and coaching down
 
----
+To my manager (2 sentences): "The Billing CSAT drop traces mainly to a spike in reopened tickets around refund-timing confusion. So we've updated the refund macro and are coaching agents on proactive expectation-setting. I'll have reopen-rate and CSAT numbers to confirm the fix is working within two to three weeks."
 
-*We're less interested in a "correct" answer than in how you think through ambiguity *
+Coaching an agent (1:1): I'd pull up one or two of their actual tickets and walk through them together. "Here's what you told the customer about refund timing, here's what actually happened. Let's talk through how to phrase this so it holds up." It's specific, example-driven, and focused on building the skill, not reciting the aggregate numbers. I'd also ask them what they think is causing the reopens (they may know something the data doesn't show like a policy that changed but wasn't documented).
+
+How this differs:
+Upward, it's compressed to the diagnosis, the fix, and a timeline.
+Coaching down leaves room for an agent to ask questions, push back, or explain context.
+
